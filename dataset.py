@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from mindspore.dataset import text, GeneratorDataset
 from mindspore import Tensor
-from sklearn.model_selection import train_test_split
+# from sklearn.model_selection import train_test_split
 
 class PretrainDataset():
     def __init__(self,data_path_lst,max_length=256,memmap=False):

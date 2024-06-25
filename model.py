@@ -49,7 +49,8 @@ def reshape_for_broadcast(freqs_cis: mindspore.Tensor, x: mindspore.Tensor):
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
+    # freqs_cos = freqs_cis.view((1, 511, 1, 32))
+    return freqs_cis.view(tuple(shape))
 
 def apply_rotary_emb(
     xq: mindspore.Tensor,
@@ -73,8 +74,10 @@ def apply_rotary_emb(
     xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
 
     # flatten last two dimensions
-    xq_out = ops.stack([xq_out_r, xq_out_i], axis=-1).flatten(3)
-    xk_out = ops.stack([xk_out_r, xk_out_i], axis=-1).flatten(3)
+    xq_out = ops.stack([xq_out_r, xq_out_i], axis=-1)
+    xk_out = ops.stack([xk_out_r, xk_out_i], axis=-1)
+    xq_out = ops.flatten(xq_out, start_dim=3)
+    xk_out = ops.flatten(xk_out, start_dim=3)
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
@@ -107,7 +110,7 @@ class Attention(nn.Cell):
         self.dropout = args.dropout
 
         # use flash attention or a manual implementation?
-        print("WARNING: using slow attention. Flash Attention not supported")
+        # print("WARNING: using slow attention. Flash Attention not supported")
         mask = ops.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
         mask = ops.triu(mask, diagonal=1)
         self.mask = mask
@@ -235,9 +238,8 @@ class Transformer(nn.Cell):
             if cell.bias is not None:
                 cell.bias.set_data(initializer('zeros', cell.bias.shape, cell.bias.dtype))
         elif isinstance(cell, nn.Embedding):
-            weight = initializer(Normal(0.02),
-                                    cell.weight.shape, cell.weight.dtype)
-            cell.weight.set_data(weight)
+            weight = np.random.normal(0.0, 0.02, cell.embedding_table.shape)
+            cell.embedding_table.set_data(mindspore.Tensor(weight, cell.embedding_table.dtype))
 
     def construct(self, tokens: mindspore.Tensor, targets: Optional[mindspore.Tensor] = None) -> mindspore.Tensor:
         _bsz, seqlen = tokens.shape
@@ -253,7 +255,7 @@ class Transformer(nn.Cell):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            self.last_loss = ops.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            self.last_loss = ops.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -264,6 +266,8 @@ class Transformer(nn.Cell):
     def configure_optimizers(self, weight_decay, learning_rate, beta1, beta2):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.parameters_and_names()}
+        # for name, param in self.parameters_and_names():
+        #     print(f"param_dict of {name}: {param.shape}")
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
@@ -274,15 +278,17 @@ class Transformer(nn.Cell):
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+        
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(nn.AdamWeightDecay(eps=1e-8, weight_decay=0.01)).parameters
-        use_fused = fused_available #and device_type == 'cuda'
+        fused_available = 'fused' in inspect.signature(nn.AdamWeightDecay).parameters
+        use_fused = fused_available
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = nn.AdamWeightDecay(optim_groups, learning_rate=learning_rate, beta1=beta1, beta2=beta2, **extra_args)
+        
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
@@ -330,10 +336,11 @@ class Transformer(nn.Cell):
                     logits[logits < v[:, [-1]]] = -float('Inf')
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = ops.softmax(logits, axis=-1)
-                idx_next = ops.multinomial(probs, num_samples=1)
+                idx_next = ops.multinomial(probs, num_samples=1, replacement=False)
             # append sampled index to the running sequence and continue
+            idx_next = idx_next.astype(mindspore.int64)
             idx = ops.cat((idx, idx_next), axis=1)
-            if idx_next==eos:
+            if idx_next.asnumpy().item(0)==eos:
                 break
 
         return idx
